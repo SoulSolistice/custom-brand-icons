@@ -3,7 +3,7 @@ name: SVG Normalize & Preview for PRs
 
 on:
   pull_request_target:
-    branches: [main]
+    branches: [dev]
     types: [opened, reopened, synchronize, ready_for_review]
     paths:
       - "custom-brand-icons/icon-svg/**/*.svg"
