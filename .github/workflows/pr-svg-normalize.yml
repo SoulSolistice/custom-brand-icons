@@ -6,7 +6,7 @@ on:
     branches: [dev]
     types: [opened, reopened, synchronize, ready_for_review]
     paths:
-      - "custom-brand-icons/icon-svg/**/*.svg"
+      - "icon-svg/**/*.svg"
   workflow_dispatch:
     inputs:
       pr_number:
@@ -110,7 +110,7 @@ jobs:
               if (data.length < 100) break;
             }
 
-            const iconRoot = "custom-brand-icons/icon-svg/";
+            const iconRoot = "icon-svg/";
             const svgFiles = files.filter(f => f.toLowerCase().endsWith(".svg"));
             const iconSvgs = svgFiles.filter(f => f.startsWith(iconRoot));
 
@@ -224,7 +224,7 @@ jobs:
             fi
 
             case "$dst" in
-              pr-branch/custom-brand-icons/icon-svg/*.svg) ;;
+              pr-branch/icon-svg/*.svg) ;;
               *) echo "Refusing to write outside icon-svg: $dst"; exit 1 ;;
             esac
 
