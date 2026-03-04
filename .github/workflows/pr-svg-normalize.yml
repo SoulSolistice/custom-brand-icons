@@ -62,7 +62,7 @@ jobs:
       # -- 2. Install deps from main's lockfile (never from the PR tree) -----
       - name: Install dependencies
         run: npm ci
-        working-directory: base/custom-brand-icons
+        working-directory: base
 
       # -- 3. Checkout PR branch (assets only; no code from here is run) -----
       - name: Checkout PR branch (assets only)
@@ -197,7 +197,7 @@ jobs:
           steps.changed.outputs.has_icon_svgs == 'true' &&
           steps.changed.outputs.has_bad_subfolders != 'true'
         run: |
-          node base/custom-brand-icons/script/normalize-icons.mjs \
+          node base/script/normalize-icons.mjs \
             "$RUNNER_TEMP/icon_stage" \
             "$RUNNER_TEMP/icon_stage" \
             --clean
