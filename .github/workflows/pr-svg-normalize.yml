@@ -189,7 +189,7 @@ jobs:
 
             cp -f "$src" "$dst"
           done < "$RUNNER_TEMP/changed_svgs.txt"
-          
+
           # Capture file size
           echo "${base}:$(stat -c '%s' "$dst")" >> "$RUNNER_TEMP/sizes_before.txt"
 
@@ -337,13 +337,13 @@ jobs:
             base="$(basename "$file")"
             url_before="https://raw.githubusercontent.com/${BASE_REPO}/dev/${file}"
             url_after="https://raw.githubusercontent.com/${PR_REPO}/${AFTER_SHA}/${file}"
-          
+
             # Read sizes (default to 0 if file not found — e.g. new icon with no before)
             size_before=$(grep -m1 "^${base}:" "$RUNNER_TEMP/sizes_before.txt" 2>/dev/null \\
                             | cut -d: -f2 || echo "0")
             size_after=$(grep  -m1 "^${base}:" "$RUNNER_TEMP/sizes_after.txt"  2>/dev/null \\
                             | cut -d: -f2 || echo "0")
-          
+
             if [ "$size_before" -gt 0 ] && [ "$size_after" -gt 0 ]; then
               saved=$(( size_before - size_after ))
               pct=$(awk "BEGIN { printf \\"%.0f\\", ($saved / $size_before) * 100 }")
@@ -352,7 +352,7 @@ jobs:
             else
               result="n/a"
             fi
-          
+
             if git -C base cat-file -e "HEAD:${file}" 2>/dev/null; then
               printf '| ![](%s) | ![](%s) | %s |\\n' \\
                 "$url_before" "$url_after" "$result" >> "$RUNNER_TEMP/report.md"
