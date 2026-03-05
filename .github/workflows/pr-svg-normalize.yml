@@ -71,8 +71,10 @@ jobs:
           repository: ${{ steps.pr.outputs.head_repo }}
           ref: ${{ steps.pr.outputs.head_ref }}
           path: pr-branch
-          fetch-depth: 0
+          fetch-depth: 1
+          submodules: false
           # keep default persist-credentials behavior (clearer intent since we may push)
+      - run: git -C base fetch --depth=1 origin dev:refs/remotes/origin/dev
 
       # -- 4. Guard: prevent infinite loop on our own normalize commits -------
       - name: Guard against re-trigger loop
@@ -137,7 +139,7 @@ jobs:
           steps.changed.outputs.has_bad_subfolders == 'true'
         run: |
           set -euo pipefail
-          echo "Subfolders are not allowed under custom-brand-icons/icon-svg."
+          echo "Subfolders are not allowed under icon-svg."
           echo ""
           echo "Offending paths:"
           cat "$RUNNER_TEMP/bad_svgs.txt"
@@ -153,7 +155,7 @@ jobs:
           set -euo pipefail
           ROOT="pr-branch/icon-svg"
           if find "$ROOT" -type l -print -quit | grep -q .; then
-            echo "Symlinks are not allowed under custom-brand-icons/icon-svg."
+            echo "Symlinks are not allowed under icon-svg."
             find "$ROOT" -type l -print
             exit 1
           fi
@@ -169,6 +171,7 @@ jobs:
           STAGE="$RUNNER_TEMP/icon_stage"
           rm -rf "$STAGE"
           mkdir -p "$STAGE"
+          : > "$RUNNER_TEMP/sizes_before.txt"
 
           while IFS= read -r file; do
             [ -z "$file" ] && continue
@@ -189,7 +192,7 @@ jobs:
 
             cp -f "$src" "$dst"
             # Capture file size
-            echo "${base}:$(stat -c '%s' "$dst")" >> "$RUNNER_TEMP/sizes_before.txt"
+            echo "${file}:$(stat -c '%s' "$dst")" >> "$RUNNER_TEMP/sizes_before.txt"
           done < "$RUNNER_TEMP/changed_svgs.txt"
 
       # -- 9. Normalize ONLY the staged icons (SVGO -> normalize -> SVGO) ----
@@ -212,11 +215,13 @@ jobs:
           steps.changed.outputs.has_bad_subfolders != 'true'
         run: |
           set -euo pipefail
+
+          : > "$RUNNER_TEMP/sizes_after.txt"
+
           while IFS= read -r file; do
             [ -z "$file" ] && continue
             base="$(basename "$file")"
-            echo "${base}:$(stat -c '%s' "$RUNNER_TEMP/icon_stage/${base}")" \\
-              >> "$RUNNER_TEMP/sizes_after.txt"
+            echo "${file}:$(stat -c '%s' "$RUNNER_TEMP/icon_stage/${base}")" >> "$RUNNER_TEMP/sizes_after.txt"
           done < "$RUNNER_TEMP/changed_svgs.txt"
 
       # -- 11. Copy normalized results back to the PR tree -------------------
@@ -311,54 +316,63 @@ jobs:
           steps.changed.outputs.has_icon_svgs == 'true'
         env:
           BASE_REPO: ${{ github.repository }}
+          BASE_REF:  dev
           PR_REPO:   ${{ steps.pr.outputs.head_repo }}
+          HEAD_SHA:  ${{ steps.pr.outputs.head_sha }}
           AFTER_SHA: ${{ steps.commit.outputs.sha || steps.pr.outputs.head_sha }}
           PUSH_OK:   ${{ steps.push.outputs.ok || 'true' }}
         run: |
-          set -euo pipefail # prevent security relevant leaks
+          set -euo pipefail
+
           {
             echo "### 🎨 SVG Normalization Report"
             echo ""
             if [ "${PUSH_OK}" != "true" ]; then
               echo "> ⚠️ Normalization ran, but **the workflow could not push back to the PR branch**."
               echo ">"
-              echo "> If this is a fork PR, enable **“Allow edits by maintainers”** in the PR UI, then re-run:"
-              echo "> **Actions → SVG Normalize & Preview → Re-run jobs** (or workflow_dispatch with pr_number)."
+              echo "> If this is a fork PR, enable **“Allow edits by maintainers”** in the PR UI, then re-run."
               echo ">"
-              echo "> Note: the “Normalized” preview below cannot show the cleaned icon until the push succeeds."
+              echo "> Note: the “Normalized” preview cannot show the cleaned icon until the push succeeds."
               echo ""
             fi
-            echo "| Original (dev) | Normalized | Result |"
+            echo "| Original (PR) | Normalized | Result |"
             echo "| :---: | :---: | :--- |"
           } > "$RUNNER_TEMP/report.md"
 
           while IFS= read -r file; do
             [ -z "$file" ] && continue
             base="$(basename "$file")"
-            url_before="https://raw.githubusercontent.com/${BASE_REPO}/dev/${file}"
+
+            url_before="https://raw.githubusercontent.com/${PR_REPO}/${HEAD_SHA}/${file}"
             url_after="https://raw.githubusercontent.com/${PR_REPO}/${AFTER_SHA}/${file}"
 
-            # Read sizes (default to 0 if file not found — e.g. new icon with no before)
-            size_before=$(grep -m1 "^${base}:" "$RUNNER_TEMP/sizes_before.txt" 2>/dev/null \\
-                            | cut -d: -f2 || echo "0")
-            size_after=$(grep  -m1 "^${base}:" "$RUNNER_TEMP/sizes_after.txt"  2>/dev/null \\
-                            | cut -d: -f2 || echo "0")
+            size_before="$(grep -m1 "^${file}:" "$RUNNER_TEMP/sizes_before.txt" 2>/dev/null | cut -d: -f2 || true)"
+            size_after="$(grep  -m1 "^${file}:" "$RUNNER_TEMP/sizes_after.txt"  2>/dev/null | cut -d: -f2 || true)"
 
-            if [ "$size_before" -gt 0 ] && [ "$size_after" -gt 0 ]; then
+
+            if [ -n "${size_before:-}" ] && [ -n "${size_after:-}" ] &&
+               [ "$size_before" -gt 0 ] && [ "$size_after" -gt 0 ]; then
               saved=$(( size_before - size_after ))
-              pct=$(awk -v s="$saved" -v b="$size_before" 'BEGIN { printf "%.0f", (s / b) * 100 }')
-              result="${size_before}B → ${size_after}B (↓ ${pct}%)"
-              [ "$saved" -lt 0 ] && result="${size_before}B → ${size_after}B (↑ $(( -pct ))%)"
+              pct="$(awk -v s="$saved" -v b="$size_before" 'BEGIN { printf "%.1f", (s*100.0)/b }')"
+
+              if [ "$saved" -gt 0 ]; then
+                result="${size_before}B → ${size_after}B (−${saved}B, −${pct}%)"
+              elif [ "$saved" -lt 0 ]; then
+                inc=$(( -saved ))
+                pct_abs="$(awk -v s="$inc" -v b="$size_before" 'BEGIN { printf "%.1f", (s*100.0)/b }')"
+                result="${size_before}B → ${size_after}B (+${inc}B, +${pct_abs}%)"
+              else
+                result="${size_before}B → ${size_after}B (0B, 0.0%)"
+              fi
             else
               result="n/a"
             fi
 
-            if git -C base cat-file -e "HEAD:${file}" 2>/dev/null; then
-              printf '| ![](%s) | ![](%s) | %s |\\n' \\
-                "$url_before" "$url_after" "$result" >> "$RUNNER_TEMP/report.md"
+            # New icon detection against BASE_REF
+            if git -C base cat-file -e "refs/remotes/origin/dev:${file}" 2>/dev/null; then
+              printf '| ![](%s) | ![](%s) | %s |\n' "$url_before" "$url_after" "$result" >> "$RUNNER_TEMP/report.md"
             else
-              printf '| *(new icon)* | ![](%s) | 🆕 New (%sB) |\\n' \\
-                "$url_after" "$size_after" >> "$RUNNER_TEMP/report.md"
+              printf '| *(new icon)* | ![](%s) | 🆕 New (%sB) |\\n' "$url_after" "${size_after:-n/a}" >> "$RUNNER_TEMP/report.md"
             fi
           done < "$RUNNER_TEMP/changed_svgs.txt"
 
