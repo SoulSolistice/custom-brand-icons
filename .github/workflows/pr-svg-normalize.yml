@@ -26,7 +26,7 @@ jobs:
       # -- 0. Resolve PR context for both triggers --------------------------
       - name: Resolve PR context
         id: pr
-        uses: actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea # v7.0.1
+        uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8.0.0
         with:
           script: |
             const isPR = context.eventName === "pull_request_target";
@@ -53,7 +53,7 @@ jobs:
 
       # -- 1. Checkout MAIN (trusted scripts & deps — never the PR head) -----
       - name: Checkout main (trusted scripts)
-        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           ref: main
           path: base
@@ -66,7 +66,7 @@ jobs:
 
       # -- 3. Checkout PR branch (assets only; no code from here is run) -----
       - name: Checkout PR branch (assets only)
-        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           repository: ${{ steps.pr.outputs.head_repo }}
           ref: ${{ steps.pr.outputs.head_ref }}
@@ -91,7 +91,7 @@ jobs:
       - name: Identify changed SVGs (and enforce flat icon-svg/)
         if: steps.guard.outputs.skip != 'true'
         id: changed
-        uses: actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea # v7.0.1
+        uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8.0.0
         env:
           PR_NUMBER: ${{ steps.pr.outputs.number }}
         with:
@@ -151,7 +151,7 @@ jobs:
           steps.changed.outputs.has_bad_subfolders != 'true'
         run: |
           set -euo pipefail
-          ROOT="pr-branch/custom-brand-icons/icon-svg"
+          ROOT="pr-branch/icon-svg"
           if find "$ROOT" -type l -print -quit | grep -q .; then
             echo "Symlinks are not allowed under custom-brand-icons/icon-svg."
             find "$ROOT" -type l -print
@@ -189,6 +189,9 @@ jobs:
 
             cp -f "$src" "$dst"
           done < "$RUNNER_TEMP/changed_svgs.txt"
+          
+          # Capture file size
+          echo "${base}:$(stat -c '%s' "$dst")" >> "$RUNNER_TEMP/sizes_before.txt"
 
       # -- 9. Normalize ONLY the staged icons (SVGO -> normalize -> SVGO) ----
       - name: Normalize staged SVGs
@@ -202,7 +205,22 @@ jobs:
             "$RUNNER_TEMP/icon_stage" \
             --clean
 
-      # -- 10. Copy normalized results back to the PR tree -------------------
+      # -- 10. Capture final size change -------------------------------------
+      - name: Capture post-normalization sizes
+        if: |
+          steps.guard.outputs.skip != 'true' &&
+          steps.changed.outputs.has_icon_svgs == 'true' &&
+          steps.changed.outputs.has_bad_subfolders != 'true'
+        run: |
+          set -euo pipefail
+          while IFS= read -r file; do
+            [ -z "$file" ] && continue
+            base="$(basename "$file")"
+            echo "${base}:$(stat -c '%s' "$RUNNER_TEMP/icon_stage/${base}")" \\
+              >> "$RUNNER_TEMP/sizes_after.txt"
+          done < "$RUNNER_TEMP/changed_svgs.txt"
+
+      # -- 11. Copy normalized results back to the PR tree -------------------
       - name: Apply normalized SVGs to PR branch
         if: |
           steps.guard.outputs.skip != 'true' &&
@@ -231,7 +249,7 @@ jobs:
             cp -f "$src" "$dst"
           done < "$RUNNER_TEMP/changed_svgs.txt"
 
-      # -- 11. Commit only the changed icon paths ----------------------------
+      # -- 12. Commit only the changed icon paths ----------------------------
       - name: Commit normalized icons (changed only)
         if: |
           steps.guard.outputs.skip != 'true' &&
@@ -259,7 +277,7 @@ jobs:
 
           echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
 
-      # -- 12. Push back to PR branch (forks: requires GitHub to allow it) ---
+      # -- 13. Push back to PR branch (forks: requires GitHub to allow it) ---
       - name: Push normalization commit back to PR branch
         if: |
           steps.guard.outputs.skip != 'true' &&
@@ -286,7 +304,7 @@ jobs:
           fi
           echo "ok=true" >> "$GITHUB_OUTPUT"
 
-      # -- 13. Build report --------------------------------------------------
+      # -- 14. Build report --------------------------------------------------
       - name: Build comparison comment
         if: |
           steps.guard.outputs.skip != 'true' &&
@@ -310,30 +328,46 @@ jobs:
               echo "> Note: the “Normalized” preview below cannot show the cleaned icon until the push succeeds."
               echo ""
             fi
-            echo "| Original (main) | Normalized | Status |"
+            echo "| Original (dev) | Normalized | Result |"
             echo "| :---: | :---: | :--- |"
           } > "$RUNNER_TEMP/report.md"
 
           while IFS= read -r file; do
             [ -z "$file" ] && continue
-            url_before="https://raw.githubusercontent.com/${BASE_REPO}/main/${file}"
+            base="$(basename "$file")"
+            url_before="https://raw.githubusercontent.com/${BASE_REPO}/dev/${file}"
             url_after="https://raw.githubusercontent.com/${PR_REPO}/${AFTER_SHA}/${file}"
-
-            if git -C base cat-file -e "HEAD:${file}" 2>/dev/null; then
-              printf '| ![](%s) | ![](%s) | ✅ Updated |\n' \
-                "$url_before" "$url_after" >> "$RUNNER_TEMP/report.md"
+          
+            # Read sizes (default to 0 if file not found — e.g. new icon with no before)
+            size_before=$(grep -m1 "^${base}:" "$RUNNER_TEMP/sizes_before.txt" 2>/dev/null \\
+                            | cut -d: -f2 || echo "0")
+            size_after=$(grep  -m1 "^${base}:" "$RUNNER_TEMP/sizes_after.txt"  2>/dev/null \\
+                            | cut -d: -f2 || echo "0")
+          
+            if [ "$size_before" -gt 0 ] && [ "$size_after" -gt 0 ]; then
+              saved=$(( size_before - size_after ))
+              pct=$(awk "BEGIN { printf \\"%.0f\\", ($saved / $size_before) * 100 }")
+              result="${size_before}B → ${size_after}B (↓ ${pct}%)"
+              [ "$saved" -lt 0 ] && result="${size_before}B → ${size_after}B (↑ $(( -pct ))%)"
             else
-              printf '| *(new icon)* | ![](%s) | 🆕 New |\n' \
-                "$url_after" >> "$RUNNER_TEMP/report.md"
+              result="n/a"
+            fi
+          
+            if git -C base cat-file -e "HEAD:${file}" 2>/dev/null; then
+              printf '| ![](%s) | ![](%s) | %s |\\n' \\
+                "$url_before" "$url_after" "$result" >> "$RUNNER_TEMP/report.md"
+            else
+              printf '| *(new icon)* | ![](%s) | 🆕 New (%sB) |\\n' \\
+                "$url_after" "$size_after" >> "$RUNNER_TEMP/report.md"
             fi
           done < "$RUNNER_TEMP/changed_svgs.txt"
 
-      # -- 14. Post or update PR comment ------------------------------------
+      # -- 15. Post or update PR comment ------------------------------------
       - name: Post comparison comment
         if: |
           steps.guard.outputs.skip != 'true' &&
           steps.changed.outputs.has_icon_svgs == 'true'
-        uses: actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea # v7.0.1
+        uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8.0
         env:
           PR_NUMBER: ${{ steps.pr.outputs.number }}
         with:
@@ -374,7 +408,7 @@ jobs:
               });
             }
 
-      # -- 15. Fail job when push back is not possible (after notifying) ------
+      # -- 16. Fail job when push back is not possible (after notifying) ------
       - name: Fail job when push back is not possible
         if: |
           steps.guard.outputs.skip != 'true' &&
