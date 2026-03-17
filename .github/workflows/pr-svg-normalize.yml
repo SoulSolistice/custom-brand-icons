@@ -69,14 +69,20 @@ jobs:
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           repository: ${{ steps.pr.outputs.head_repo }}
-          ref: ${{ steps.pr.outputs.head_ref }}
+          ref: ${{ steps.pr.outputs.head_sha }}  # SHA → direct fetch, no wildcard ref pattern
           path: pr-branch
-          fetch-depth: 0   # required: shallow clone breaks fork-PR push and fetch ref patterns
+          fetch-depth: 1
           submodules: false
           # keep default persist-credentials behavior (clearer intent since we may push)
       - run: git -C base fetch --depth=1 origin dev:refs/remotes/origin/dev
 
-      # -- 4. Guard: prevent infinite loop on our own normalize commits -------
+      # -- 4. Create a local branch so git push has a target ------------------
+      - name: Attach local branch to PR head SHA
+        env:
+          HEAD_REF: ${{ steps.pr.outputs.head_ref }}
+        run: git -C pr-branch checkout -b "$HEAD_REF"
+
+      # -- 5. Guard: prevent infinite loop on our own normalize commits -------
       - name: Guard against re-trigger loop
         id: guard
         run: |
@@ -89,7 +95,7 @@ jobs:
             echo "skip=false" >> "$GITHUB_OUTPUT"
           fi
 
-      # -- 5. Identify changed SVGs (API) + enforce "no subfolders" ----------
+      # -- 6. Identify changed SVGs (API) + enforce "no subfolders" ----------
       - name: Identify changed SVGs (and enforce flat icon-svg/)
         if: steps.guard.outputs.skip != 'true'
         id: changed
@@ -102,7 +108,7 @@ jobs:
             const repo  = context.repo.repo;
             const pr    = Number(process.env.PR_NUMBER);
             const BOT_EMAIL = "41898282+github-actions[bot]@users.noreply.github.com";
-            
+
             // Get all commits on this PR
             const commits = [];
             for (let page = 1; ; page++) {
@@ -113,7 +119,7 @@ jobs:
               commits.push(...data);
               if (data.length < 100) break;
             }
-            
+
             // Collect files only from non-bot commits
             const nonBotFiles = new Set();
             for (const c of commits) {
@@ -123,7 +129,7 @@ jobs:
               });
               for (const f of (detail.files ?? [])) nonBotFiles.add(f.filename);
             }
-            
+
             const iconRoot = "icon-svg/";
             const iconSvgs = [...nonBotFiles].filter(f =>
               f.startsWith(iconRoot) && f.toLowerCase().endsWith(".svg")
@@ -145,7 +151,7 @@ jobs:
             fs.writeFileSync(`${dir}/bad_svgs.txt`,
               bad.join("\n") + (bad.length ? "\n" : ""), "utf8");
 
-      # -- 6. Fail fast if subfolders exist (policy) -------------------------
+      # -- 7. Fail fast if subfolders exist (policy) -------------------------
       - name: Reject subfolders under icon-svg
         if: |
           steps.guard.outputs.skip != 'true' &&
@@ -158,7 +164,7 @@ jobs:
           cat "$RUNNER_TEMP/bad_svgs.txt"
           exit 1
 
-      # -- 7. Guard: reject symlinks in icon-svg (prevents path escapes) ------
+      # -- 8. Guard: reject symlinks in icon-svg (prevents path escapes) ------
       - name: Reject symlinks under icon-svg
         if: |
           steps.guard.outputs.skip != 'true' &&
@@ -173,7 +179,7 @@ jobs:
             exit 1
           fi
 
-      # -- 8. Stage ONLY changed icons into a temp flat dir -------------------
+      # -- 9. Stage ONLY changed icons into a temp flat dir -------------------
       - name: Stage changed SVGs
         if: |
           steps.guard.outputs.skip != 'true' &&
@@ -208,7 +214,7 @@ jobs:
             echo "${file}:$(stat -c '%s' "$dst")" >> "$RUNNER_TEMP/sizes_before.txt"
           done < "$RUNNER_TEMP/changed_svgs.txt"
 
-      # -- 9. Normalize ONLY the staged icons (SVGO -> normalize -> SVGO) ----
+      # -- 10. Normalize ONLY the staged icons (SVGO -> normalize -> SVGO) ----
       - name: Normalize staged SVGs
         if: |
           steps.guard.outputs.skip != 'true' &&
@@ -220,7 +226,7 @@ jobs:
             "$RUNNER_TEMP/icon_stage" \
             --clean
 
-      # -- 10. Capture final size change -------------------------------------
+      # -- 11. Capture final size change -------------------------------------
       - name: Capture post-normalization sizes
         if: |
           steps.guard.outputs.skip != 'true' &&
@@ -237,7 +243,7 @@ jobs:
             echo "${file}:$(stat -c '%s' "$RUNNER_TEMP/icon_stage/${base}")" >> "$RUNNER_TEMP/sizes_after.txt"
           done < "$RUNNER_TEMP/changed_svgs.txt"
 
-      # -- 11. Copy normalized results back to the PR tree -------------------
+      # -- 12. Copy normalized results back to the PR tree -------------------
       - name: Apply normalized SVGs to PR branch
         if: |
           steps.guard.outputs.skip != 'true' &&
@@ -267,7 +273,7 @@ jobs:
             cp -f "$src" "$dst"
           done < "$RUNNER_TEMP/changed_svgs.txt"
 
-      # -- 12. Commit only the changed icon paths ----------------------------
+      # -- 13. Commit only the changed icon paths ----------------------------
       - name: Commit normalized icons (changed only)
         if: |
           steps.guard.outputs.skip != 'true' &&
@@ -295,7 +301,7 @@ jobs:
 
           echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
 
-      # -- 13. Push back to PR branch (forks: requires GitHub to allow it) ---
+      # -- 14. Push back to PR branch (forks: requires GitHub to allow it) ---
       - name: Push normalization commit back to PR branch
         if: |
           steps.guard.outputs.skip != 'true' &&
@@ -304,6 +310,7 @@ jobs:
         env:
           GH_TOKEN:  ${{ secrets.GITHUB_TOKEN }}
           HEAD_REPO: ${{ steps.pr.outputs.head_repo }}
+          HEAD_REF:  ${{ steps.pr.outputs.head_ref }}
         run: |
           set -euo pipefail
           echo "::add-mask::$GH_TOKEN"
@@ -312,7 +319,7 @@ jobs:
           git remote set-url origin "https://x-access-token:${GH_TOKEN}@github.com/${HEAD_REPO}.git"
 
           set +e
-          git push
+          git push origin "HEAD:refs/heads/${HEAD_REF}"
           RC=$?
           set -e
 
@@ -322,7 +329,7 @@ jobs:
           fi
           echo "ok=true" >> "$GITHUB_OUTPUT"
 
-      # -- 14. Build report --------------------------------------------------
+      # -- 15. Build report --------------------------------------------------
       - name: Build comparison comment
         if: |
           steps.guard.outputs.skip != 'true' &&
@@ -403,7 +410,7 @@ jobs:
             fi
           done < "$RUNNER_TEMP/changed_svgs.txt"
 
-      # -- 15. Post or update PR comment ------------------------------------
+      # -- 16. Post or update PR comment ------------------------------------
       - name: Post comparison comment
         if: |
           steps.guard.outputs.skip != 'true' &&
@@ -449,7 +456,7 @@ jobs:
               });
             }
 
-      # -- 16. Fail job when push back is not possible (after notifying) ------
+      # -- 17. Fail job when push back is not possible (after notifying) ------
       - name: Fail job when push back is not possible
         if: |
           steps.guard.outputs.skip != 'true' &&
