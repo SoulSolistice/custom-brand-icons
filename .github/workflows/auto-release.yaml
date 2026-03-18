@@ -1,0 +1,152 @@
+name: Auto Release
+
+on:
+  schedule:
+    - cron: "0 2 * * *" # Daily at 02:00 UTC
+  workflow_dispatch:
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 0
+
+      # -- 1. Find the latest release tag ---------------------------------------
+      - name: Get latest release tag
+        id: latest_release
+        run: |
+          LATEST_TAG=$(git tag --sort=-creatordate | head -n 1)
+          echo "latest_tag=$LATEST_TAG" >> "$GITHUB_OUTPUT"
+          echo "Latest tag: '${LATEST_TAG}'"
+
+      # -- 2. Detect new / modified SVG files since that tag --------------------
+      - name: Check for new icons
+        id: check_icons
+        run: |
+          LATEST_TAG="${{ steps.latest_release.outputs.latest_tag }}"
+
+          if [ -z "$LATEST_TAG" ]; then
+            COUNT=$(find icon-svg -name "*.svg" | wc -l)
+            [ "$COUNT" -gt 0 ] && HAS_NEW=true || HAS_NEW=false
+          else
+            CHANGES=$(git diff --name-only "$LATEST_TAG" HEAD -- 'icon-svg/*.svg')
+            [ -n "$CHANGES" ] && HAS_NEW=true || HAS_NEW=false
+          fi
+
+          echo "has_new_icons=$HAS_NEW" >> "$GITHUB_OUTPUT"
+
+      # -- 3. Compute the next YYYY.MM.COUNTER tag ------------------------------
+      - name: Determine next tag
+        if: steps.check_icons.outputs.has_new_icons == 'true'
+        id: next_tag
+        run: |
+          YEAR=$(date -u +%Y)
+          MONTH=$(date -u +%m)
+          PREFIX="${YEAR}.${MONTH}"
+
+          HIGHEST=$(git tag --list "${PREFIX}.*" \
+            | sed "s/^${PREFIX}\.//" \
+            | grep -E '^[0-9]+$' \
+            | sort -n \
+            | tail -n 1)
+
+          COUNTER=$(( ${HIGHEST:-0} + 1 ))
+          NEW_TAG="${PREFIX}.${COUNTER}"
+
+          echo "new_tag=$NEW_TAG" >> "$GITHUB_OUTPUT"
+          echo "Next tag: $NEW_TAG"
+
+      # -- 4. Build the distribution file ---------------------------------------
+      - name: Setup Node.js
+        if: steps.check_icons.outputs.has_new_icons == 'true'
+        uses: actions/setup-node@53b83947a5a98c8d113130e565377fae1a50d02f # v6.3.0
+        with:
+          node-version: "24"
+
+      - name: Run builder
+        if: steps.check_icons.outputs.has_new_icons == 'true'
+        run: node custom-icons-builder.cjs
+
+      # -- 5. Generate rich release notes ---------------------------------------
+      - name: Generate release notes
+        if: steps.check_icons.outputs.has_new_icons == 'true'
+        id: release_notes
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+        run: |
+          LATEST_TAG="${{ steps.latest_release.outputs.latest_tag }}"
+          NEW_TAG="${{ steps.next_tag.outputs.new_tag }}"
+          ICON_COUNT=$(find icon-svg -name "*.svg" | wc -l)
+          RAW_BASE="https://raw.githubusercontent.com/${REPO}/main/icon-svg"
+
+          # -- Icon table ------------------------------------------------------
+          if [ -n "$LATEST_TAG" ]; then
+            CHANGED_FILES=$(git diff --name-only "$LATEST_TAG" HEAD -- 'icon-svg/*.svg')
+          else
+            CHANGED_FILES=$(find icon-svg -name "*.svg")
+          fi
+
+          ICON_TABLE="| Icon | Name |\n|:----:|------|\n"
+          while IFS= read -r f; do
+            [ -z "$f" ] && continue
+            NAME=$(basename "$f" .svg)
+            ICON_TABLE+="| <img src=\"${RAW_BASE}/${NAME}.svg\" width=\"24\" height=\"24\"> | \`${NAME}\` |\n"
+          done <<< "$CHANGED_FILES"
+
+          # -- What's Changed (merged PRs since last tag) ----------------------
+          WHATS_CHANGED=""
+          if [ -n "$LATEST_TAG" ]; then
+            # Get the date of the last tag's commit
+            TAG_DATE=$(git log -1 --format="%cI" "$LATEST_TAG")
+
+            # Fetch merged PRs after that date via GitHub API
+            PR_JSON=$(gh api \
+              "repos/${REPO}/pulls?state=closed&base=main&per_page=50" \
+              --jq ".[] | select(.merged_at != null and .merged_at > \"${TAG_DATE}\") | \"* \" + .title + \" by @\" + .user.login + \" in [#\" + (.number|tostring) + \"](\" + .html_url + \")\"")
+
+            if [ -n "$PR_JSON" ]; then
+              WHATS_CHANGED="\n## What's Changed\n\n${PR_JSON}\n"
+              WHATS_CHANGED+="**Full Changelog:** https://github.com/${REPO}/compare/${LATEST_TAG}...${NEW_TAG}\n"
+            fi
+          fi
+
+          # -- Assemble the full notes into a temp file ------------------------
+          # (avoids shell quoting issues with multiline strings)
+          NOTES_FILE=$(mktemp)
+          {
+            echo "**Total icons in this release:** ${ICON_COUNT}"
+            echo ""
+            echo "## New / updated icons"
+            echo ""
+            printf "%b" "$ICON_TABLE"
+            printf "%b" "$WHATS_CHANGED"
+          } > "$NOTES_FILE"
+
+          echo "notes_file=$NOTES_FILE" >> "$GITHUB_OUTPUT"
+
+      # -- 6. Tag & publish the GitHub release ----------------------------------
+      - name: Create GitHub Release
+        if: steps.check_icons.outputs.has_new_icons == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          NEW_TAG="${{ steps.next_tag.outputs.new_tag }}"
+
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git tag -a "$NEW_TAG" -m "Release $NEW_TAG"
+          git push origin "$NEW_TAG"
+
+          gh release create "$NEW_TAG" \
+            dist/custom-brand-icons.js \
+            --title "$NEW_TAG" \
+            --notes-file "${{ steps.release_notes.outputs.notes_file }}"
+
+          echo "✅ Release $NEW_TAG published."
