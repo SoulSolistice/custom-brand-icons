@@ -100,25 +100,55 @@ jobs:
             ICON_TABLE+="| <img src=\"${RAW_BASE}/${NAME}.svg\" width=\"24\" height=\"24\"> | \`${NAME}\` |\n"
           done <<< "$CHANGED_FILES"
 
-          # -- What's Changed (merged PRs since last tag) ----------------------
+          # -- What's Changed + Contributors (non-bot only) --------------------
           WHATS_CHANGED=""
+          CONTRIBUTORS_SECTION=""
+
           if [ -n "$LATEST_TAG" ]; then
             # Get the date of the last tag's commit
             TAG_DATE=$(git log -1 --format="%cI" "$LATEST_TAG")
 
-            # Fetch merged PRs after that date via GitHub API
+            # Fetch merged PRs after the tag date, exclude bots
+            # Bot signals: login ends in [bot], or user.type == "Bot"
             PR_JSON=$(gh api \
               "repos/${REPO}/pulls?state=closed&base=main&per_page=50" \
-              --jq ".[] | select(.merged_at != null and .merged_at > \"${TAG_DATE}\") | \"* \" + .title + \" by @\" + .user.login + \" in [#\" + (.number|tostring) + \"](\" + .html_url + \")\"")
+              --jq ".[] |
+                select(
+                  .merged_at != null and
+                  .merged_at > \"${TAG_DATE}\" and
+                  (.user.type != \"Bot\") and
+                  (.user.login | test(\"\\\\[bot\\\\]$\") | not)
+                ) |
+                \"* \" + .title + \" by @\" + .user.login + \" in [#\" + (.number|tostring) + \"](\" + .html_url + \")\"")
 
             if [ -n "$PR_JSON" ]; then
-              WHATS_CHANGED="\n## What's Changed\n\n${PR_JSON}\n"
+              WHATS_CHANGED="\n## What's Changed\n\n${PR_JSON}\n\n"
               WHATS_CHANGED+="**Full Changelog:** https://github.com/${REPO}/compare/${LATEST_TAG}...${NEW_TAG}\n"
+            fi
+
+            # Collect unique non-bot contributors from those same PRs
+            CONTRIBUTORS=$(gh api \
+              "repos/${REPO}/pulls?state=closed&base=main&per_page=50" \
+              --jq "[.[] |
+                select(
+                  .merged_at != null and
+                  .merged_at > \"${TAG_DATE}\" and
+                  (.user.type != \"Bot\") and
+                  (.user.login | test(\"\\\\[bot\\\\]$\") | not)
+                ) |
+                .user.login] | unique | .[]")
+
+            if [ -n "$CONTRIBUTORS" ]; then
+              CONTRIB_LINE=""
+              while IFS= read -r LOGIN; do
+                [ -z "$LOGIN" ] && continue
+                CONTRIB_LINE+="[@${LOGIN}](https://github.com/${LOGIN}) "
+              done <<< "$CONTRIBUTORS"
+              CONTRIBUTORS_SECTION="\n## Contributors\n\n${CONTRIB_LINE}\n"
             fi
           fi
 
           # -- Assemble the full notes into a temp file ------------------------
-          # (avoids shell quoting issues with multiline strings)
           NOTES_FILE=$(mktemp)
           {
             echo "**Total icons in this release:** ${ICON_COUNT}"
@@ -126,6 +156,7 @@ jobs:
             echo "## New / updated icons"
             echo ""
             printf "%b" "$ICON_TABLE"
+            printf "%b" "$CONTRIBUTORS_SECTION"
             printf "%b" "$WHATS_CHANGED"
           } > "$NOTES_FILE"
 
