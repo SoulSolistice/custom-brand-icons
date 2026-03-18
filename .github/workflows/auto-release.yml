@@ -26,17 +26,24 @@ jobs:
           echo "Latest tag: '${LATEST_TAG}'"
 
       # -- 2. Detect new / modified SVG files since that tag --------------------
+      #       Also saves the list for reuse in step 5 (avoids a second git call)
       - name: Check for new icons
         id: check_icons
         run: |
           LATEST_TAG="${{ steps.latest_release.outputs.latest_tag }}"
 
           if [ -z "$LATEST_TAG" ]; then
-            COUNT=$(find icon-svg -name "*.svg" | wc -l)
-            [ "$COUNT" -gt 0 ] && HAS_NEW=true || HAS_NEW=false
+            CHANGED_FILES=$(find icon-svg -name "*.svg")
           else
-            CHANGES=$(git diff --name-only "$LATEST_TAG" HEAD -- 'icon-svg/*.svg')
-            [ -n "$CHANGES" ] && HAS_NEW=true || HAS_NEW=false
+            CHANGED_FILES=$(git diff --name-only "$LATEST_TAG" HEAD -- 'icon-svg/*.svg')
+          fi
+
+          if [ -n "$CHANGED_FILES" ]; then
+            HAS_NEW=true
+            # Persist file list for the release notes step
+            echo "$CHANGED_FILES" > /tmp/changed_icons.txt
+          else
+            HAS_NEW=false
           fi
 
           echo "has_new_icons=$HAS_NEW" >> "$GITHUB_OUTPUT"
@@ -86,65 +93,62 @@ jobs:
           ICON_COUNT=$(find icon-svg -name "*.svg" | wc -l)
           RAW_BASE="https://raw.githubusercontent.com/${REPO}/main/icon-svg"
 
-          # -- Icon table ------------------------------------------------------
-          if [ -n "$LATEST_TAG" ]; then
-            CHANGED_FILES=$(git diff --name-only "$LATEST_TAG" HEAD -- 'icon-svg/*.svg')
-          else
-            CHANGED_FILES=$(find icon-svg -name "*.svg")
-          fi
-
+          # -- Icon table (reuse file list from step 2) ------------------------
           ICON_TABLE="| Icon | Name |\n|:----:|------|\n"
           while IFS= read -r f; do
             [ -z "$f" ] && continue
             NAME=$(basename "$f" .svg)
             ICON_TABLE+="| <img src=\"${RAW_BASE}/${NAME}.svg\" width=\"24\" height=\"24\"> | \`${NAME}\` |\n"
-          done <<< "$CHANGED_FILES"
+          done < /tmp/changed_icons.txt
 
-          # -- What's Changed + Contributors (non-bot PRs and direct commits) --
+          # -- What's Changed + Contributors -----------------------------------
           WHATS_CHANGED=""
           CONTRIBUTORS_SECTION=""
 
           if [ -n "$LATEST_TAG" ]; then
-            TAG_DATE=$(git log -1 --format="%cI" "$LATEST_TAG")
-
-            # Fetch PRs and commits once each into temp files
             PR_FILE=$(mktemp)
-            COMMITS_FILE=$(mktemp)
+            COMPARE_FILE=$(mktemp)
             PR_SHA_FILE=$(mktemp)
 
-            gh api "repos/${REPO}/pulls?state=closed&base=main&per_page=50" > "$PR_FILE"
-            gh api "repos/${REPO}/commits?sha=main&per_page=100"            > "$COMMITS_FILE"
+            # compare API returns exactly the commits between two refs — no date math needed
+            gh api "repos/${REPO}/compare/${LATEST_TAG}...HEAD"                               > "$COMPARE_FILE"
+            # per_page=100 is the API maximum; avoids silently truncating busy months
+            gh api "repos/${REPO}/pulls?state=closed&base=main&per_page=100&sort=updated&direction=desc" > "$PR_FILE"
 
-            # SHA array of ALL PR merges since tag (to exclude from direct commits)
-            jq -r '[.[] |
+            # Derive the cutoff timestamp from the compare response (same format as PR merged_at)
+            TAG_DATE=$(jq -r '.base_commit.commit.committer.date' "$COMPARE_FILE")
+
+            # Build SHA set of every PR merge commit in this window (compact JSON array)
+            jq -c '[.[] |
               select(.merged_at != null and .merged_at > "'"$TAG_DATE"'") |
               .merge_commit_sha]' "$PR_FILE" > "$PR_SHA_FILE"
 
-            # -- Non-bot PR lines --------------------------------------------
+            # -- Non-bot PR lines ----------------------------------------------
             PR_LINES=$(jq -r '.[] |
               select(
                 .merged_at != null and
                 .merged_at > "'"$TAG_DATE"'" and
-                (.user.type != "Bot") and
-                (.user.login | test("\\[bot\\]$") | not)
+                (.user.type   != "Bot") and
+                (.user.login  | test("\\[bot\\]$") | not)
               ) |
               "* " + .title + " by @" + .user.login +
               " in [#" + (.number|tostring) + "](" + .html_url + ")"' "$PR_FILE")
 
-            # -- Direct commits: not a PR merge, not a bot -------------------
+            # -- Direct non-bot commits (not covered by any PR merge SHA) ------
+            # Also skips "Merge branch/pull request" commit messages
             DIRECT_LINES=$(jq -r --slurpfile pr_shas "$PR_SHA_FILE" '
-              .[] |
+              .commits[] |
               select(
-                .commit.committer.date > "'"$TAG_DATE"'" and
                 (.sha as $s | $pr_shas[0] | index($s) == null) and
+                (.commit.message | ltrimstr(" ") | startswith("Merge ") | not) and
                 .author != null and
-                (.author.type // "" | . != "Bot") and
+                (.author.type  // "" | . != "Bot") and
                 (.author.login | test("\\[bot\\]$") | not)
               ) |
               "* " + (.commit.message | split("\n")[0]) +
-              " by @" + .author.login' "$COMMITS_FILE")
+              " by @" + .author.login' "$COMPARE_FILE")
 
-            # -- Combine into What's Changed ---------------------------------
+            # -- Combine PR + direct commit lines -----------------------------
             ALL_CHANGES=""
             [ -n "$PR_LINES"     ] && ALL_CHANGES+="${PR_LINES}\n"
             [ -n "$DIRECT_LINES" ] && ALL_CHANGES+="${DIRECT_LINES}\n"
@@ -154,61 +158,27 @@ jobs:
               WHATS_CHANGED+="**Full Changelog:** https://github.com/${REPO}/compare/${LATEST_TAG}...${NEW_TAG}\n"
             fi
 
-            # -- Contributors: union of PR authors + direct commit authors ---
+            # -- Contributors: union of PR authors + direct commit authors -----
             PR_CONTRIBS=$(jq -r '[.[] |
               select(
                 .merged_at != null and
                 .merged_at > "'"$TAG_DATE"'" and
-                (.user.type != "Bot") and
-                (.user.login | test("\\[bot\\]$") | not)
+                (.user.type   != "Bot") and
+                (.user.login  | test("\\[bot\\]$") | not)
               ) | .user.login] | unique | .[]' "$PR_FILE")
 
             DIRECT_CONTRIBS=$(jq -r --slurpfile pr_shas "$PR_SHA_FILE" '[
-              .[] |
+              .commits[] |
               select(
-                .commit.committer.date > "'"$TAG_DATE"'" and
                 (.sha as $s | $pr_shas[0] | index($s) == null) and
+                (.commit.message | ltrimstr(" ") | startswith("Merge ") | not) and
                 .author != null and
-                (.author.type // "" | . != "Bot") and
+                (.author.type  // "" | . != "Bot") and
                 (.author.login | test("\\[bot\\]$") | not)
-              ) | .author.login] | unique | .[]' "$COMMITS_FILE")
+              ) | .author.login] | unique | .[]' "$COMPARE_FILE")
 
-            ALL_CONTRIBS=$(printf '%s\n%s' "$PR_CONTRIBS" "$DIRECT_CONTRIBS" | sort -u | grep -v '^
-
-          # -- Assemble the full notes into a temp file ------------------------
-          NOTES_FILE=$(mktemp)
-          {
-            echo "**Total icons in this release:** ${ICON_COUNT}"
-            echo ""
-            echo "## New / updated icons"
-            echo ""
-            printf "%b" "$ICON_TABLE"
-            printf "%b" "$CONTRIBUTORS_SECTION"
-            printf "%b" "$WHATS_CHANGED"
-          } > "$NOTES_FILE"
-
-          echo "notes_file=$NOTES_FILE" >> "$GITHUB_OUTPUT"
-
-      # -- 6. Tag & publish the GitHub release ----------------------------------
-      - name: Create GitHub Release
-        if: steps.check_icons.outputs.has_new_icons == 'true'
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          NEW_TAG="${{ steps.next_tag.outputs.new_tag }}"
-
-          git config user.name  "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git tag -a "$NEW_TAG" -m "Release $NEW_TAG"
-          git push origin "$NEW_TAG"
-
-          gh release create "$NEW_TAG" \
-            dist/custom-brand-icons.js \
-            --title "$NEW_TAG" \
-            --notes-file "${{ steps.release_notes.outputs.notes_file }}"
-
-          echo "✅ Release $NEW_TAG published."
-)
+            ALL_CONTRIBS=$(printf '%s\n%s' "$PR_CONTRIBS" "$DIRECT_CONTRIBS" \
+              | sort -u | grep -v '^$')
 
             if [ -n "$ALL_CONTRIBS" ]; then
               CONTRIB_LINE=""
@@ -218,7 +188,10 @@ jobs:
               CONTRIBUTORS_SECTION="\n## Contributors\n\n${CONTRIB_LINE}\n"
             fi
 
-            rm -f "$PR_FILE" "$COMMITS_FILE" "$PR_SHA_FILE"
+            rm -f "$PR_FILE" "$COMPARE_FILE" "$PR_SHA_FILE"
+          else
+            # First-ever release: no previous tag to compare against
+            WHATS_CHANGED="\n*This is the first automated release — no prior tag to compare against.*\n"
           fi
 
           # -- Assemble the full notes into a temp file ------------------------
