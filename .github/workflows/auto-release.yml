@@ -22,6 +22,7 @@ jobs:
         with:
           fetch-depth: 0
 
+      # -- 1. Find the latest release tag ---------------------------------------
       - name: Determine previous release tag
         id: prev_tag
         shell: bash
@@ -38,8 +39,12 @@ jobs:
           echo "previous_tag=${PREV_TAG}" >> "$GITHUB_OUTPUT"
           echo "Previous tag: '${PREV_TAG}'"
 
+      # -- 2. Detect new / modified SVG files since that tag (non bot) ----------
       - name: Detect changed icons
         id: changed_icons
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
         shell: bash
         run: |
           set -euo pipefail
@@ -47,22 +52,45 @@ jobs:
           PREV_TAG="${{ steps.prev_tag.outputs.previous_tag }}"
 
           if [ -z "$PREV_TAG" ]; then
+            # First release: include only SVGs currently present.
+            # There is no prior range to classify by author.
             find icon-svg -type f -name '*.svg' | sort > changed_icons.txt
           else
-            git diff --name-only "$PREV_TAG"..HEAD -- \
-              | grep -E '^icon-svg/[^/]+\.svg$' \
-              | sort -u > changed_icons.txt || true
+            COMPARE_FILE="$(mktemp)"
+            trap 'rm -f "$COMPARE_FILE"' EXIT
+
+            gh api \
+              "repos/${REPO}/compare/${PREV_TAG}...HEAD?per_page=100" \
+              > "$COMPARE_FILE"
+
+            jq -r '
+              .commits[]
+              | select(
+                  .author != null and
+                  (.author.type // "") != "Bot" and
+                  (.author.login // "" | test("\\[bot\\]$") | not) and
+                  (.author.login // "") != "github-actions"
+                )
+              | .sha
+            ' "$COMPARE_FILE" \
+            | while IFS= read -r sha; do
+                [ -n "$sha" ] || continue
+                git diff-tree --no-commit-id --name-only -r "$sha"
+              done \
+            | grep -E '^icon-svg/[^/]+\.svg$' \
+            | sort -u > changed_icons.txt || true
           fi
 
           if [ -s changed_icons.txt ]; then
             echo "has_changes=true" >> "$GITHUB_OUTPUT"
-            echo "Changed icons:"
+            echo "Changed non-bot icons:"
             cat changed_icons.txt
           else
             echo "has_changes=false" >> "$GITHUB_OUTPUT"
-            echo "No icon changes detected."
+            echo "No non-bot icon changes detected."
           fi
 
+      # -- 3. Compute the next YYYY.MM.COUNTER tag ------------------------------
       - name: Determine next tag
         if: steps.changed_icons.outputs.has_changes == 'true'
         id: next_tag
@@ -88,6 +116,7 @@ jobs:
           echo "new_tag=${NEW_TAG}" >> "$GITHUB_OUTPUT"
           echo "Next tag: ${NEW_TAG}"
 
+      # -- 4. Build the distribution file ---------------------------------------
       - name: Setup Node.js
         if: steps.changed_icons.outputs.has_changes == 'true'
         uses: actions/setup-node@53b83947a5a98c8d113130e565377fae1a50d02f # v6.3.0
@@ -101,6 +130,7 @@ jobs:
           set -euo pipefail
           node custom-icons-builder.cjs
 
+      # -- 5. Generate rich release notes ---------------------------------------
       - name: Generate release notes
         if: steps.changed_icons.outputs.has_changes == 'true'
         id: release_notes
@@ -210,6 +240,7 @@ jobs:
 
           echo "notes_file=${NOTES_FILE}" >> "$GITHUB_OUTPUT"
 
+      # -- 6. Tag & publish the GitHub release ----------------------------------
       - name: Create GitHub release
         if: steps.changed_icons.outputs.has_changes == 'true'
         env:
